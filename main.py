@@ -2,19 +2,21 @@ import os
 import asyncpg
 import json
 import logging
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
+import aiohttp
 
-# Setup logging so we can see exactly what happens in Render
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("chrm-api")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ENGINE_SECRET = os.environ.get("ENGINE_SECRET", "fallback_secret_123")
+IMAGE_WEBHOOK_URL = os.environ.get("IMAGE_WEBHOOK_URL")
 
 db_pool = None
 
@@ -23,7 +25,6 @@ async def lifespan(app: FastAPI):
     global db_pool
     logger.info("⏳ Connecting to Neon Database...")
     try:
-        # Add timeout to prevent hanging
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         
         async with db_pool.acquire() as conn:
@@ -40,7 +41,6 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Database connected and table checked!")
     except Exception as e:
         logger.error(f"❌ DATABASE CONNECTION FAILED: {e}")
-        # Don't crash the app, just log it. (Render will keep it alive, but routes will fail if DB is down).
         
     yield
     
@@ -50,27 +50,23 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# 🚨 BULLETPROOF CORS (Fixes the Safari "Load Failed" bug)
+# 🚨 BULLETPROOF CORS (Fixes iOS Safari "Load failed")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
-    allow_credentials=False, # MUST BE FALSE when using "*"
+    allow_credentials=False, 
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
-# Global exception handler to always return JSON, even on crashes
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Internal Server Error: {str(exc)}"},
-    )
+    return JSONResponse(status_code=500, content={"detail": f"Internal Server Error: {str(exc)}"})
 
 class TokenLogin(BaseModel):
     token: str
-    discord_id: str = "test_user"
+    discord_id: str
 
 class SettingsUpdate(BaseModel):
     settings: dict
@@ -78,7 +74,6 @@ class SettingsUpdate(BaseModel):
 
 @app.post("/api/auth/token")
 async def login_with_token(data: TokenLogin):
-    logger.info(f"Received token for {data.discord_id}")
     if not db_pool:
         raise HTTPException(status_code=500, detail="Database not connected")
         
@@ -92,7 +87,7 @@ async def login_with_token(data: TokenLogin):
         return {"status": "success", "message": "Token saved successfully"}
     except Exception as e:
         logger.error(f"Failed to save token: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save token to database")
+        raise HTTPException(status_code=500, detail="Failed to save token")
 
 @app.get("/api/user/{discord_id}")
 async def get_user_settings(discord_id: str):
@@ -102,7 +97,6 @@ async def get_user_settings(discord_id: str):
     async with db_pool.acquire() as conn:
         user = await conn.fetchrow("SELECT settings, is_active FROM users WHERE discord_id = $1", discord_id)
         if not user:
-            # If user doesn't exist yet, return default settings instead of 404
             return {"settings": {}, "is_active": False}
         return {"settings": json.loads(user["settings"]), "is_active": user["is_active"]}
 
@@ -112,9 +106,7 @@ async def update_user_settings(discord_id: str, data: SettingsUpdate):
         raise HTTPException(status_code=500, detail="Database not connected")
         
     async with db_pool.acquire() as conn:
-        # Check if user exists
         user = await conn.fetchrow("SELECT settings FROM users WHERE discord_id = $1", discord_id)
-        
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
@@ -127,6 +119,61 @@ async def update_user_settings(discord_id: str, data: SettingsUpdate):
             await conn.execute("UPDATE users SET settings = $1 WHERE discord_id = $2", json.dumps(current), discord_id)
             
     return {"status": "success"}
+
+@app.post("/api/rpc/{discord_id}")
+async def update_rpc(
+    discord_id: str, 
+    rpc_type: str = Form(...),
+    name: str = Form(...),
+    details: str = Form(""),
+    state: str = Form(""),
+    image: UploadFile = File(None)
+):
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    image_url = None
+    
+    # 1. Upload image to Discord Webhook to get a permanent CDN link
+    if image and IMAGE_WEBHOOK_URL:
+        try:
+            async with aiohttp.ClientSession() as session:
+                form = aiohttp.FormData()
+                file_bytes = await image.read()
+                form.add_field('file', file_bytes, filename=image.filename)
+                
+                async with session.post(IMAGE_WEBHOOK_URL, data=form) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        image_url = data["attachments"][0]["url"]
+                    else:
+                        logger.error(f"Webhook upload failed: {resp.status}")
+        except Exception as e:
+            logger.error(f"Image upload error: {e}")
+
+    # 2. Save RPC settings to Neon
+    rpc_data = {
+        "type": rpc_type,
+        "name": name,
+        "details": details,
+        "state": state,
+        "image_url": image_url
+    }
+
+    async with db_pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT settings FROM users WHERE discord_id = $1", discord_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+            
+        current_settings = json.loads(user["settings"])
+        current_settings["rpc"] = rpc_data
+        
+        await conn.execute(
+            "UPDATE users SET settings = $1 WHERE discord_id = $2", 
+            json.dumps(current_settings), discord_id
+        )
+        
+    return {"status": "success", "image_url": image_url}
 
 @app.get("/api/engine/bots")
 async def get_bots(x_engine_secret: str = Header(None)):
@@ -147,7 +194,15 @@ async def get_bots(x_engine_secret: str = Header(None)):
             } for u in users
         ]
 
-# 🚨 FIXED UPTIMEROBOT 404 ISSUE (Handles both GET and HEAD)
+@app.delete("/api/auth/logout/{discord_id}")
+async def logout(discord_id: str):
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="Database not connected")
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM users WHERE discord_id = $1", discord_id)
+    return {"status": "success", "message": "logged out"}
+
+# 🚨 UPTIMEROBOT FIX
 @app.api_route("/", methods=["GET", "HEAD"])
 def health():
     return {"status": "chrm api is online"}
