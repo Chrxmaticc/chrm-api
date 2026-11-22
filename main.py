@@ -18,19 +18,34 @@ from dotenv import load_dotenv
 # vars; this only matters for local runs.
 load_dotenv()
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("chrm-api")
+
+DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
+ENGINE_SECRET = (os.environ.get("ENGINE_SECRET") or "").strip()
+IMAGE_WEBHOOK_URL = os.environ.get("IMAGE_WEBHOOK_URL")
+
+# A missing ENGINE_SECRET used to fall back to a hardcoded string, so anyone who
+# read this file could call /api/engine/bots and walk off with every stored bot
+# token; a missing DATABASE_URL used to boot "healthy" and 500 on every route.
+# Both stop the process now, so the deploy fails loudly instead of serving that.
+_PLACEHOLDER_SECRETS = {"fallback_secret_123", "changeme", "secret", "password"}
+if not DATABASE_URL:
+    raise SystemExit("chrm-api: refusing to start, DATABASE_URL is not set")
+if not ENGINE_SECRET:
+    raise SystemExit("chrm-api: refusing to start, ENGINE_SECRET is not set")
+if ENGINE_SECRET.lower() in _PLACEHOLDER_SECRETS:
+    raise SystemExit(
+        "chrm-api: refusing to start, ENGINE_SECRET is still a placeholder value"
+    )
+
+# Imported after the checks above: dashboard_auth snapshots its secrets on import.
 from dashboard_auth import (
     issue as issue_dashboard_key,
     verify as verify_dashboard_key,
     matches_engine_secret,
 )
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("chrm-api")
-
-DATABASE_URL = os.environ.get("DATABASE_URL")
-ENGINE_SECRET = os.environ.get("ENGINE_SECRET", "fallback_secret_123")
-IMAGE_WEBHOOK_URL = os.environ.get("IMAGE_WEBHOOK_URL")
 
 db_pool = None
 
