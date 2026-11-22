@@ -13,15 +13,28 @@ import hmac
 import os
 import time
 
-#: falls back to ENGINE_SECRET so a deployment only has to set one secret
-_SECRET = (
-    os.environ.get("DASHBOARD_SECRET")
-    or os.environ.get("ENGINE_SECRET")
-    or "fallback_secret_123"
-).encode()
+
+def _read_secret(name: str) -> bytes:
+    """Read a required secret, refusing the placeholder that used to be here.
+
+    The old "fallback_secret_123" default meant an unset ENGINE_SECRET still
+    authenticated every engine call, so it is gone rather than merely deprecated.
+    """
+    value = (os.environ.get(name) or "").strip()
+    if not value or value == "fallback_secret_123":
+        raise RuntimeError(f"{name} must be set to a real secret")
+    return value.encode()
+
 
 #: the engine's own secret, accepted in place of a dashboard key on server-to-server calls
-_ENGINE_SECRET = (os.environ.get("ENGINE_SECRET") or "fallback_secret_123").encode()
+_ENGINE_SECRET = _read_secret("ENGINE_SECRET")
+
+#: falls back to ENGINE_SECRET so a deployment only has to set one secret
+_SECRET = (
+    _read_secret("DASHBOARD_SECRET")
+    if (os.environ.get("DASHBOARD_SECRET") or "").strip()
+    else _ENGINE_SECRET
+)
 
 #: 30 days; a dashboard that has not been opened in a month logs in again
 TTL = int(os.environ.get("DASHBOARD_KEY_TTL") or 60 * 60 * 24 * 30)
