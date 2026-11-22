@@ -1,4 +1,5 @@
 import os
+import re
 import asyncpg
 import json
 import logging
@@ -9,6 +10,13 @@ from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
 import aiohttp
+from dotenv import load_dotenv
+
+# Load .env before anything reads os.environ (DATABASE_URL, ENGINE_SECRET,
+# DASHBOARD_SECRET, IMAGE_WEBHOOK_URL). dashboard_auth snapshots its secret at
+# import time, so this has to run before that import. Render supplies real env
+# vars; this only matters for local runs.
+load_dotenv()
 
 from dashboard_auth import (
     issue as issue_dashboard_key,
@@ -32,7 +40,7 @@ async def lifespan(app: FastAPI):
     logger.info("⏳ Connecting to Neon Database...")
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-        
+
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
@@ -47,9 +55,9 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Database connected and table checked!")
     except Exception as e:
         logger.error(f"❌ DATABASE CONNECTION FAILED: {e}")
-        
+
     yield
-    
+
     if db_pool:
         logger.info("Closing database pool...")
         await db_pool.close()
@@ -59,11 +67,41 @@ app = FastAPI(lifespan=lifespan)
 # 🚨 BULLETPROOF CORS (Fixes iOS Safari "Load failed")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
-    allow_credentials=False, 
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
+
+
+class CollapseDuplicateSlashes:
+    """Serve "//api/auth/token" the same as "/api/auth/token".
+
+    Clients that join a base URL ending in "/" with a path starting in "/"
+    (``f"{base}/api/auth/token"``) reach us with a doubled slash. Starlette
+    matches paths literally, so those requests used to 404 even though the
+    route exists. Normalising the path before routing keeps every endpoint
+    reachable however the caller built the URL. Query strings are untouched.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            path = scope.get("path", "")
+            fixed = re.sub(r"/{2,}", "/", path)
+            if fixed != path:
+                scope = dict(scope)
+                scope["path"] = fixed
+                raw_path = scope.get("raw_path")
+                if raw_path:
+                    scope["raw_path"] = re.sub(rb"/{2,}", b"/", raw_path)
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(CollapseDuplicateSlashes)
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
